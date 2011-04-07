@@ -1,0 +1,185 @@
+=pod
+
+=head1 SYNOPSIS
+
+This plugin applies a DKIM signature to outgoing mail.
+
+It is useful as a content filter:
+
+C<http://www.postfix.org/FILTER_README.html>
+
+=head1 CONFIG
+
+=over 4
+
+=item keyfile
+
+Name of Base64 DKIM private key file. Defaults to dkim-key
+
+=item headers
+
+If specified, a colon-delimited list of headers for DKIM to sign. See
+C<Mail::DKIM::Signer>
+
+=item headerfile
+
+Name of a config file specifying headers for DKIM to sign. Defaults to
+dkim-headers, and will use default DKIM headers if the file is not
+present.
+
+=item domain
+
+Required, the domain this DKIM instance will sign for
+
+=item selector
+
+Required, which selector to use in signing message
+
+=item algorithm
+
+Algorithm to sign message with. Defaults to 'rsa-sha1'. See C<Mail::DKIM::Signer>
+
+=item method
+
+Method to sign message with. Defaults to 'relaxed'. See C<Mail::DKIM::Signer>
+
+=item maxsz
+
+If specified, maximum size of a message, in bytes, to sign
+
+=item requirerelay
+
+If set to 0, does not require relay access for the connecting user to use
+the signature.
+
+=cut
+
+=head1 AUTHOR
+
+Copyright (C) 2011 Chase Venters <chase.venters@gmail.com>
+L<http://www.chaseventers.org/>
+
+This software is free software and may be distributed under the same
+terms as qpsmtpd itself.
+
+I wrote this plugin after I noticed no dkimsign plugin on the Qpsmtpd
+wiki, but then I found one on Google. I borrowed the maxsz argument idea
+from it.
+
+L<http://alecto.bittwiddlers.com/files/qpsmtpd/dkimsign>
+
+=cut
+
+use Mail::DKIM::Signer;
+use Mail::DKIM::TextWrap;
+
+sub init {
+	my ($self, $qp, @args) = @_;
+
+	# Make sure we have an even number of arguments (k=>v)
+	if (@_ % 2) {
+		$self->log(LOGERROR, "Bad parameters for the dkimsign plugin");
+		die 'Bad parameters for the dkimsign plugin';
+	}
+
+	# Load named arguments
+	my %args = @args;
+	$self->{_args} = \%args;
+
+	# Make sure we have a domain and selector
+	if (!exists($args{domain}) || !exists($args{selector})) {
+		$self->log(LOGERROR, "domain and selector are required for the dkimsign plugin");
+		die 'domain and selector are required for the dkimsign plugin';
+	}
+
+	# Set default arguments
+	$args{algorithm} = 'rsa-sha1' unless exists $args{algorithm};
+	$args{method} = 'relaxed' unless exists $args{method};
+	$args{requirerelay} = 1 unless exists $args{requirerelay};
+
+	# Determine and load keyfile
+	my $keyfile = $args{keyfile};
+	$keyfile = 'dkim-key' unless defined $keyfile;
+	my @keydata = $self->qp->config($keyfile);
+	my $kbuf = join('', @keydata);
+	if (!defined($kbuf) || $kbuf =~ /^\s+$/) {
+		$self->log(LOGERROR, "$keyfile is missing or empty");
+		die "$keyfile is missing or empty";
+	}
+
+	# Maik::DKIM::PrivateKey stupidly appends its own ----- lines
+	$kbuf =~ s/^\s+//g;
+	$kbuf =~ s/\s+$//g;
+	$kbuf =~ s/^\-\-\-\-\-.+?\-\-\-\-\-//;
+	$kbuf =~ s/\-\-\-\-\-.+?\-\-\-\-\-$//;
+
+	# Load key
+	$self->{_key} = Mail::DKIM::PrivateKey->load(
+		Data => $kbuf,
+	);
+
+	# Determine and load headerfile
+	my $headerfile = $args{headerfile};
+	$headerfile = 'dkim-headers' unless defined($headerfile);
+	my @headers = $self->qp->config($headerfile);
+	if (@headers) {
+		$args{headers} = join(':', @headers);
+	}
+}
+
+sub hook_data_post {
+	my ($self, $transaction) = @_;
+
+	my $args = $self->{_args};
+
+	# Don't apply signature unless authenticated or allowed to skip authentication
+	unless ($args->{requirerelay} == 0 || $self->qp->connection->relay_client) {
+		return DECLINED;
+	}
+
+	# Check for maximum message size
+	my $maxdsz = $args->{maxsz};
+	my $dsz = $transaction->data_size;
+	if (defined($maxdsz) && $maxdsz < $dsz) {
+		return DECLINED;
+	}
+
+	# Create a DKIM signer
+	my @headers;
+	if ($args->{headers}) {
+		@headers = (Headers => $args->{headers});
+	}
+	my $dkim = Mail::DKIM::Signer->new(
+		Algorithm => $args->{algorithm},
+		Method => $args->{method},
+		Domain => $args->{domain},
+		Selector => $args->{selector},
+		Key => $self->{_key},
+		@headers
+	);
+
+	# Dump mail header to DKIM
+	my $th = $transaction->header->as_string;
+	$th =~ s/\r?\n/\r\n/g;
+	$dkim->PRINT($th);
+
+	# Dump body to DKIM
+	$transaction->body_resetpos;
+	while (defined(my $line = $transaction->body_getline)) {
+		$line =~ s/\r?\n/\r\n/g;
+		$dkim->PRINT($line);
+	}
+
+	# Generate DKIM signature
+	$dkim->CLOSE;
+
+	# Prepend DKIM signature
+	my @sigs = $dkim->signatures;
+	for my $signature (@sigs) {
+		$transaction->header->add(undef, $signature->as_string, 0);
+	}
+
+	# Continue processing
+	return (DECLINED);
+}
+

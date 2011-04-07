@@ -1,0 +1,9 @@
+Build
+_build/
+blib/
+*~
+MANIFEST
+MANIFEST.bak
+META.yml
+pkg/
+.*.swp
